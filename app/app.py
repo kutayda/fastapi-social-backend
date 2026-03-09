@@ -1,33 +1,98 @@
-from fastapi import FastAPI, HTTPException
-from app.schemas import PostCreate
+import uuid
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from app.schemas import PostCreate, PostResponse
+from app.db import Post, create_db_and_tables, get_async_session
+from sqlalchemy.ext.asyncio import AsyncSession
+from contextlib import asynccontextmanager
+from sqlalchemy import select
+from app.images import imagekit
+import shutil
+import os 
+import tempfile
 
-text_posts = {
-    1: {"title": "First Post", "content": "Hello world! This is my first FastAPI test post."},
-    2: {"title": "PC Build Advice", "content": "Should I get the RTX 5070 Ti or wait for the new series?"},
-    3: {"title": "Valorant Patch Notes", "content": "The new agent's abilities seem a bit too overpowered for competitive mode."},
-    4: {"title": "My Flutter Experience", "content": "State management became much easier after figuring out the GetX architecture."},
-    5: {"title": "Dandadan Review", "content": "I read the manga, but the anime's animation and soundtrack are truly incredible!"},
-    6: {"title": "FastAPI and Pydantic", "content": "Using BaseModel for data validation is a lifesaver compared to doing it manually."},
-    7: {"title": "Database Connection", "content": "Finally connected my API to the database successfully. Next step: JWT security!"},
-    8: {"title": "OLED Monitor Choice", "content": "How much has the burn-in issue been resolved on the new generation 2K OLED panels? Anyone using one?"},
-    9: {"title": "Internship Diaries", "content": "Started working with Python and FastAPI on the backend today. It's been fun."},
-    10: {"title": "Latest MrBeast Video", "content": "The production quality in the latest video has truly surpassed TV shows."}
-}
-@app.get("/posts")
-def get_all_posts(limit: int = None):
-    if limit: 
-        return list(text_posts.values())[:limit]
-    return text_posts   
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await create_db_and_tables()
+    yield
 
+app = FastAPI(lifespan=lifespan)
 
-@app.get("/posts/{id}")
-def get_post(id:int):
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail="post not found")
-    return text_posts.get(id)
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    caption: str = Form(...),
+    session: AsyncSession = Depends(get_async_session),
+):
+    temp_file_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
+            
+        with open(temp_file_path, "rb") as image_file:
+            upload_result = imagekit.files.upload(
+                file=image_file,
+                file_name=file.filename,
+                use_unique_file_name=True,    
+                tags=["backend-upload"]
+            ) 
+        
+        post = Post(
+            caption=caption,
+            url=upload_result.url,
+            file_type="video" if file.content_type.startswith("video/") else "image",
+            file_name=upload_result.name 
+        )
+        session.add(post)
+        await session.commit()
+        await session.refresh(post)
+        return post 
 
-@app.post("/post")
-def create_post(post: PostCreate):
-    text_posts[max(text_posts.keys())+ 1] = {"title": post.title, "content": post.content}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass 
+        file.file.close()
+
+@app.get("/feed")
+async def get_feed(
+    session: AsyncSession = Depends(get_async_session)
+):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+    
+    posts = [row[0] for row in result.all()] 
+    
+    post_data = []
+    for post in posts: 
+        post_data.append({
+            "id": post.id,
+            "caption": post.caption,
+            "url": post.url,
+            "file_type": post.file_type,
+            "file_name": post.file_name, 
+            "created_at": post.created_at
+        })
+
+    return {"posts": post_data}
+
+@app.delete("/posts/{post_id}")
+async def delete_post(post_id: str, session: AsyncSession = Depends(get_async_session)):
+    try: 
+        post_uuid = uuid.UUID(post_id)
+        result = await session.execute(select(Post).where(Post.id == post_uuid))
+        post = result.scalars().first()
+        
+        if not post: 
+            raise HTTPException(status_code=404, detail="Post not found")
+        
+        await session.delete(post)
+        await session.commit()
+        
+        return {"success": "Post deleted successfully"} 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
